@@ -1,0 +1,377 @@
+import os
+import time
+import hmac
+import hashlib
+import base64
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime
+from ta.momentum import RSIIndicator
+from ta.trend import EMAIndicator
+from ta.volume import OnBalanceVolumeIndicator, MFIIndicator
+import telepotautomatica RSI, EMA, OBV, MFI per Bitget (Shadowwolf PRO)
+
+
+class ShadowwolfAnalyst:
+    INTERVAL_MIN = 1
+    SEND_WAIT = False
+    
+    def __init__(self):
+        self.api_key = os.environ.get('BITGET_API_KEY')
+        self.api_secret = os.environ.get('BITGET_API_SECRET')
+        self.passphrase = os.environ.get('BITGET_API_PASS')
+        self.bot_token = os.environ.get('BOT_TOKEN')
+        self.chat_id = os.environ.get('CHAT_ID')
+        
+        self.base_url = "https://api.bitget.com"
+        
+        if not all([self.api_key, self.api_secret, self.passphrase, self.bot_token, self.chat_id]):
+            raise ValueError("Missing required environment variables")
+        
+        assert self.api_key is not None
+        assert self.api_secret is not None
+        assert self.passphrase is not None
+        assert self.bot_token is not None
+        
+        self.bot = telepot.Bot(self.bot_token)
+        
+        self.symbols_display = ['BTCUSDT_UMCBL', 'ETHUSDT_UMCBL']
+        self.symbols_api = ['BTCUSDT', 'ETHUSDT']
+        self.product_type = 'usdt-futures'
+        self.last_signals = {}
+        
+        try:
+            self.chat_id = int(self.chat_id) if self.chat_id else 0
+        except (ValueError, TypeError):
+            self.chat_id = 0
+        
+        print("🐺 Shadowwolf Analyst fully operational")
+        print(f"📊 Monitoring: {', '.join(self.symbols_display)}")
+        print(f"📱 Telegram Chat ID: {self.chat_id}")
+    
+    def _sign(self, message):
+        mac = hmac.new(bytes(str(self.api_secret), encoding='utf8'), bytes(message, encoding='utf-8'), digestmod=hashlib.sha256)
+        return base64.b64encode(mac.digest()).decode()
+    
+    def _get_headers(self, timestamp, method, request_path, body=''):
+        message = timestamp + method + request_path + body
+        signature = self._sign(message)
+        
+        return {
+            'ACCESS-KEY': self.api_key,
+            'ACCESS-SIGN': signature,
+            'ACCESS-TIMESTAMP': timestamp,
+            'ACCESS-PASSPHRASE': self.passphrase,
+            'Content-Type': 'application/json'
+        }
+    
+    def get_candles(self, symbol, granularity):
+        endpoint = '/api/v2/mix/market/history-candles'
+        
+        params = {
+            'symbol': symbol,
+            'productType': self.product_type,
+            'granularity': granularity,
+            'limit': '200'
+        }
+        
+        query_string = '&'.join([f"{k}={v}" for k, v in params.items()])
+        url = f"{self.base_url}{endpoint}?{query_string}"
+        
+        try:
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get('code') == '00000' and data.get('data'):
+                candles = data['data']
+                df = pd.DataFrame(candles)
+                df.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'usdtVolume']
+                df = df.astype({
+                    'open': float,
+                    'high': float,
+                    'low': float,
+                    'close': float,
+                    'volume': float,
+                    'usdtVolume': float
+                })
+                df = df.sort_values('timestamp').reset_index(drop=True)
+                return df
+            else:
+                print(f"⚠️ API Error: {data}")
+                return None
+        except Exception as e:
+            print(f"❌ Error fetching candles: {e}")
+            return None
+    
+    def calculate_obv_slope(self, df, window=10):
+        if df is None or len(df) < window:
+            return 0
+        
+        obv = OnBalanceVolumeIndicator(close=df['close'], volume=df['volume'])
+        obv_values = obv.on_balance_volume()
+        
+        recent_obv = obv_values.iloc[-window:].values
+        x = np.arange(window)
+        
+        if len(recent_obv) == window:
+            slope = np.polyfit(x, recent_obv, 1)[0]
+            return slope
+        return 0
+    
+    def calculate_indicators(self, df):
+        if df is None or len(df) < 200:
+            return None
+        
+        indicators = {}
+        
+        rsi = RSIIndicator(close=df['close'], window=14)
+        indicators['rsi'] = rsi.rsi().iloc[-1]
+        
+        ema50 = EMAIndicator(close=df['close'], window=50)
+        indicators['ema50'] = ema50.ema_indicator().iloc[-1]
+        
+        ema200 = EMAIndicator(close=df['close'], window=200)
+        indicators['ema200'] = ema200.ema_indicator().iloc[-1]
+        
+        obv = OnBalanceVolumeIndicator(close=df['close'], volume=df['volume'])
+        obv_values = obv.on_balance_volume()
+        indicators['obv'] = obv_values.iloc[-1]
+        indicators['obv_slope'] = self.calculate_obv_slope(df, window=10)
+        
+        mfi = MFIIndicator(high=df['high'], low=df['low'], close=df['close'], volume=df['volume'], window=14)
+        mfi_values = mfi.money_flow_index()
+        indicators['mfi'] = mfi_values.iloc[-1]
+        indicators['mfi_prev'] = mfi_values.iloc[-2]
+        
+        indicators['close'] = df['close'].iloc[-1]
+        
+        return indicators
+    
+    def analyze_shadowwolf(self, symbol_api, symbol_display):
+        df_1h = self.get_candles(symbol_api, '1H')
+        df_4h = self.get_candles(symbol_api, '4H')
+        
+        if df_1h is None or df_4h is None:
+            return None
+        
+        ind_1h = self.calculate_indicators(df_1h)
+        ind_4h = self.calculate_indicators(df_4h)
+        
+        if ind_1h is None or ind_4h is None:
+            return None
+        
+        signal = 'WAIT'
+        
+        long_conditions = [
+            ind_1h['rsi'] > 50,
+            ind_4h['rsi'] > 35,
+            ind_1h['obv_slope'] > 0,
+            ind_1h['close'] > ind_1h['ema50']
+        ]
+        
+        short_conditions = [
+            ind_1h['rsi'] < 40,
+            ind_1h['obv_slope'] < 0,
+            ind_1h['mfi'] > 80,
+            ind_1h['mfi'] < ind_1h['mfi_prev'],
+            ind_1h['close'] < ind_1h['ema200']
+        ]
+        
+        if all(long_conditions):
+            signal = 'LONG'
+        elif all(short_conditions):
+            signal = 'SHORT'
+        else:
+            signal = 'WAIT'
+        
+        trend_status = "Bullish" if ind_1h['close'] > ind_1h['ema50'] else "Bearish"
+        
+        return {
+            'symbol': symbol_display,
+            'signal': signal,
+            'price': ind_1h['close'],
+            'rsi_1h': ind_1h['rsi'],
+            'rsi_4h': ind_4h['rsi'],
+            'obv_slope': ind_1h['obv_slope'],
+            'mfi': ind_1h['mfi'],
+            'ema50': ind_1h['ema50'],
+            'ema200': ind_1h['ema200'],
+            'trend': trend_status
+        }
+    
+    def send_telegram(self, message):
+        try:
+            self.bot.sendMessage(self.chat_id, message)
+            print(f"📱 Telegram sent")
+        except Exception as e:
+            print(f"❌ Telegram error: {e}")
+
+    # ---- Utility per messaggio (NON cambiano la logica del segnale) ----
+    @staticmethod
+    def _calc_tp_sl(price: float, side: str):
+        # +1.5% / -1.5% (robusto e semplice)
+        if side == 'LONG':
+            return round(price * 1.015, 2), round(price * 0.985, 2)
+        if side == 'SHORT':
+            return round(price * 0.985, 2), round(price * 1.015, 2)
+        return None, None
+
+    @staticmethod
+    def _infer_trade_type(analysis: dict) -> str:
+        r1 = analysis.get('rsi_1h', 0) or 0
+        r4 = analysis.get('rsi_4h', 0) or 0
+        px = analysis.get('price', 0) or 0
+        ema50 = analysis.get('ema50', 0) or 0
+        ema200 = analysis.get('ema200', 0) or 0
+        mfi = analysis.get('mfi', 0) or 0
+        obv_slope = analysis.get('obv_slope', 0) or 0
+
+        near_ema = (px > 0 and (abs(px - ema50) / px) < 0.004)
+
+        if r1 >= 55 and r4 >= 45 and px > ema50 and ema50 > ema200:
+            return "Swing"
+        if near_ema or (50 <= r1 < 55) or (mfi > 75 and obv_slope < 0):
+            return "Scalping"
+        return "Intraday"
+
+    def check_and_notify(self):
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"\n🔍 [{now}] Checking signals...")
+        
+        for i, symbol_api in enumerate(self.symbols_api):
+            symbol_display = self.symbols_display[i]
+            analysis = self.analyze_shadowwolf(symbol_api, symbol_display)
+            
+            if analysis is None:
+                print(f"⚠️ {symbol_display}: Analysis failed")
+                continue
+            
+            print(f"📊 {symbol_display}: {analysis['signal']} | Price: {analysis['price']:.2f} | RSI 1h: {analysis['rsi_1h']:.2f}")
+            
+            last_signal = self.last_signals.get(symbol_display, {}).get('signal', None)
+            
+            # invia SOLO nuovi LONG/SHORT (WAIT solo se abilitato)
+            should_send = False
+            if analysis['signal'] in ['LONG', 'SHORT'] and analysis['signal'] != last_signal:
+                should_send = True
+            elif analysis['signal'] == 'WAIT':
+                if self.SEND_WAIT and last_signal in ['LONG', 'SHORT']:
+                    should_send = True
+                else:
+                    print(f"💬 WAIT message (console only): {symbol_display} at {analysis['price']:.2f}")
+            
+            if should_send:
+                message = f"🐺 Shadowwolf | {analysis['symbol']}\n"
+                message += f"⏰ {now}\n"
+                message += f"Price: {analysis['price']:.2f}\n"
+                message += f"RSI 1h: {analysis['rsi_1h']:.2f} | RSI 4h: {analysis['rsi_4h']:.2f}\n"
+                message += f"EMA50/200(1h): {analysis['trend']}\n"
+                message += f"OBV slope(1h,10): {analysis['obv_slope']:.2f} | MFI 1h: {analysis['mfi']:.2f}\n"
+                message += f"Decision: {analysis['signal']}"
+
+                # TP/SL + Tipo operazione SOLO su LONG/SHORT
+                if analysis['signal'] in ('LONG', 'SHORT'):
+                    tp, sl = self._calc_tp_sl(analysis['price'], analysis['signal'])
+                    mode = self._infer_trade_type(analysis)
+                    if tp is not None and sl is not None:
+                        message += f"\n🎯 TP: {tp} | 🛑 SL: {sl}\n📈 Modalità: {mode}"
+
+                self.send_telegram(message)
+            
+            self.last_signals[symbol_display] = analysis
+    
+    def run(self):
+        print(f"⏰ Checking every {self.INTERVAL_MIN} minute(s)...\n")
+        
+        while True:
+            try:
+                self.check_and_notify()
+                print(f"⏸️ Waiting {self.INTERVAL_MIN} minute(s) until next check...\n")
+                time.sleep(self.INTERVAL_MIN * 60)
+            except KeyboardInterrupt:
+                print("\n🛑 Shadowwolf Analyst stopped")
+                self.send_telegram("🛑 Shadowwolf Analyst Stopped")
+                break
+            except Exception as e:
+                print(f"❌ Error in main loop: {e}")
+                time.sleep(60)
+# --- mini helper per inviare un messaggio Telegram di test
+def tg_send(msg: str):
+    try:
+        import os, requests
+        token = os.getenv("TG_BOT_TOKEN", "").strip()
+        chat  = os.getenv("CHAT_ID", "").strip()
+        if not token or not chat:
+            print(f"TG OFF: {msg}")
+            return
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {
+            "chat_id": chat,
+            "text": msg,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
+        }
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print("TG test error:", e)
+
+
+if __name__ == "__main__":
+    tg_send("🐺 Test collegamento Telegram attivo — Shadowwolf è ONLINE ✅")
+    analyst = ShadowwolfAnalyst()
+    analyst.run()
+    # ===== SHADOWWOLF CONNECT BOT (versione finale e stabile) =====
+import os, requests
+
+MAIN_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CONNECT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("CHAT_ID", "").strip()
+
+def forward_to_connect(text: str):
+    """Inoltra ogni messaggio del bot principale anche al bot ponte."""
+    if not CONNECT_TOKEN or not CHAT_ID or not text:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{CONNECT_TOKEN}/sendMessage"
+        payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print("⚠️ Errore inoltro verso bot di collegamento:", e)
+
+try:
+    _old_tg_send = tg_send
+    def tg_send(text: str):
+        _old_tg_send(text)
+        forward_to_connect(text)
+except NameError:
+    pass
+if __name__ == "__main__":
+    tg_send("🐺 Test collegamento Telegram attivo — Shadowwolf è ONLINE ✅")
+
+    analyst = ShadowwolfAnalyst()
+    analyst.run()
+# ===== SHADOWWOLF CONNECT BOT =====
+import requests, os
+
+CONNECT_TOKEN = os.getenv("CONNECT_BOT_TOKEN", "").strip()
+
+def forward_to_connect(text):
+    """Inoltra i messaggi del bot principale al canale di Aegro."""
+    if not CONNECT_TOKEN or not text:
+        return
+    try:
+        # qui metti il tuo chat_id personale, lo puoi aggiornare in seguito
+        chat_id = "1413082932"
+        url = f"https://api.telegram.org/bot{CONNECT_TOKEN}/sendMessage"
+        payload = {"chat_id": chat_id, "text": text}
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print("⚠️ Errore inoltro Connect:", e)
+
+# Modifica la funzione tg_send per includere anche l’inoltro
+_old_tg_send = tg_send
+def tg_send(text):
+    _old_tg_send(text)   # invia messaggio al tuo Telegram
+    forward_to_connect(text)  # inoltra anche ad Aegro
