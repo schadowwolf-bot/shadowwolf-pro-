@@ -165,14 +165,14 @@ class ShadowwolfAnalyst:
         signal = 'WAIT'
         
         long_conditions = [
-            ind_1h['rsi'] > 50,
+            ind_1h['rsi'] > 54,
             ind_4h['rsi'] > 35,
             ind_1h['obv_slope'] > 0,
             ind_1h['close'] > ind_1h['ema50']
         ]
         
         short_conditions = [
-            ind_1h['rsi'] < 40,
+            ind_1h['rsi'] < 37,
             ind_1h['obv_slope'] < 0,
             ind_1h['mfi'] > 80,
             ind_1h['mfi'] < ind_1h['mfi_prev'],
